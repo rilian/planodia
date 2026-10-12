@@ -26,6 +26,63 @@ int cl_dynload_init(void) {
 #else // POSIX: Linux, Android
 
 #include <dlfcn.h>
+#ifdef __ANDROID__
+#include <android/dlext.h>
+#include <stdint.h>
+
+// Android 7+ keeps an app's native code out of the vendor partition: a plain dlopen("libOpenCL.so") only works when the
+// vendor lists the library as public (many Adreno / Mali phones do not -- found 2026-10-12: every task on such a phone failed with
+// "no OpenCL ICD found"). The BOINC client itself gets at the library through the loader's exported namespaces
+// (client/gpu_opencl.cpp android_dlopen); this does the same: android_dlopen_ext() with the "sphal" (vendor HAL), "vndk" or
+// "default" namespace, and as a last resort a namespace of our own that is allowed to look into /system, /vendor and /data.
+static void *cl_android_namespace_open(void) {
+    typedef void *(*dlext_fn)(const char *, int, const android_dlextinfo *);
+    typedef struct android_namespace_t *(*getns_fn)(const char *);
+    typedef struct android_namespace_t *(*mkns_fn)(const char *, const char *, const char *, uint64_t, const char *, struct android_namespace_t *);
+    static const char *nsnames[] = {"sphal", "vndk", "default", NULL};
+    static const char *libs[] = {"libOpenCL.so", "/vendor/lib64/libOpenCL.so", "/system/vendor/lib64/libOpenCL.so",
+                                 "/system/lib64/libOpenCL.so", "/vendor/lib64/egl/libGLES_mali.so", "libmali.so", NULL};
+    dlext_fn dlext = (dlext_fn)dlsym(RTLD_DEFAULT, "android_dlopen_ext");
+    if (!dlext) return NULL;
+    getns_fn getns = (getns_fn)dlsym(RTLD_DEFAULT, "android_get_exported_namespace");
+    if (!getns) getns = (getns_fn)dlsym(RTLD_DEFAULT, "__loader_android_get_exported_namespace");
+    if (getns) {
+        for (int n = 0; nsnames[n]; n++) {
+            struct android_namespace_t *ns = getns(nsnames[n]);
+            if (!ns) continue;
+            android_dlextinfo info;
+            memset(&info, 0, sizeof(info));
+            info.flags = ANDROID_DLEXT_USE_NAMESPACE;
+            info.library_namespace = ns;
+            for (int i = 0; libs[i]; i++) {
+                void *h = dlext(libs[i], RTLD_NOW, &info);
+                if (h) {
+                    fprintf(stderr, "cl_dynload_init: opened %s through the Android %s namespace\n", libs[i], nsnames[n]);
+                    return h;
+                }
+            }
+        }
+    }
+    mkns_fn mkns = (mkns_fn)dlsym(RTLD_DEFAULT, "android_create_namespace");
+    if (mkns) {
+        struct android_namespace_t *ns = mkns("bitboinc_gpu", "/system/lib64/", "/system/lib64/", 1 | 2, "/system/:/data/:/vendor/", NULL);
+        if (ns) {
+            android_dlextinfo info;
+            memset(&info, 0, sizeof(info));
+            info.flags = ANDROID_DLEXT_USE_NAMESPACE;
+            info.library_namespace = ns;
+            for (int i = 0; libs[i]; i++) {
+                void *h = dlext(libs[i], RTLD_NOW, &info);
+                if (h) {
+                    fprintf(stderr, "cl_dynload_init: opened %s through a private Android namespace\n", libs[i]);
+                    return h;
+                }
+            }
+        }
+    }
+    return NULL;
+}
+#endif
 
 int cl_dynload_init(void) {
     // Try the common ICD loader names in order -- Linux distros mostly
@@ -59,8 +116,12 @@ int cl_dynload_init(void) {
         lib = dlopen(candidates[i], RTLD_NOW | RTLD_GLOBAL);
         if (lib) break;
     }
+#ifdef __ANDROID__
+    if (!lib) lib = cl_android_namespace_open();
+#endif
     if (!lib) {
-        fprintf(stderr, "cl_dynload_init: no OpenCL ICD found on this host (tried libOpenCL.so[.1], libmali.so)\n");
+        const char *why = dlerror();
+        fprintf(stderr, "cl_dynload_init: no OpenCL ICD found on this host (tried libOpenCL.so[.1], libmali.so, vendor paths and the Android vendor namespaces)%s%s\n", why ? ": " : "", why ? why : "");
         return 0;
     }
 #define LOAD(name) do { \
