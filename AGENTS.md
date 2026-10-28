@@ -29,7 +29,7 @@ input light curve, in shard order. A light curve takes about 0.08 s on one CPU c
 | `src/cl_dynload.c`, `.h` | run-time OpenCL loader (dlopen / LoadLibrary, Android linker namespaces) and the vendor filters `cl_platform_matches_vendor()`, `cl_pick_vendor_device()`; a copy shared with other bitboinc apps (`docs/kb/kb.conf`). Its comments name files of other apps (`opencl_search.c`). |
 | `src/skt.h` | `ShardReader`: the only reader of the `SKT1` shard format |
 | `src/planodia_cli.cpp` | standalone search over shard files without BOINC (`--time`, `--gpu`), parameter overrides through `PL_*` environment variables |
-| `tools/ingest.py` | downloads TESS QLP light curves from MAST and writes the shards (the only `SKT1` writer); resumes per shard, drops light curves whose download failed (PLA-020) |
+| `tools/ingest.py` | downloads TESS QLP light curves from MAST and writes the shards (the only `SKT1` writer); resumes per shard |
 | `tools/build_cpu.sh` | CPU apps for Linux (x86_64, i686, aarch64, armhf, ppc64le, riscv64) and Windows (x86_64, x86, arm64) |
 | `tools/build_gpu_server.sh` | OpenCL apps: Linux x86_64 and Windows x86_64 per vendor (nvidia, amd, intel), Windows arm64 (qualcomm) |
 | `tools/build_mac.sh` | macOS arm64 and x86_64, CPU app and (with `OPENCL=1`) the Apple OpenCL app |
@@ -58,8 +58,8 @@ No vendored third-party code. The BOINC library and the OpenCL headers come from
   GPU, PLA-009); expect last-digit differences between CPU and GPU results.
 - **Determinism per light curve**: no random numbers, no threads; a line depends only on the light curve and
   `Params`. That is what makes a resume reproduce the same lines with the same binary. Across platforms the peak
-  order can still differ where powers tie (`std::partial_sort`, PLA-011), and FMA contraction is allowed by every
-  build (no `-ffp-contract` anywhere; PLA-010).
+  order can still differ where powers tie (`std::partial_sort`, PAT-026), and so can the last bits wherever a
+  compiler contracts to FMA (PAT-018).
 - **GPU local memory**: the kernel needs `8 * maxbins + 1280` bytes, `maxbins = ceil(pmax / binw)` rounded up to
   64. A work unit above the device's limit fails on that device (PLA-016).
 
@@ -74,13 +74,11 @@ What the code does at 3f6c1b7:
   a new `out`. A torn last line is dropped. This design is sound (PAT-002 not affected).
 - Order: every line is written and `fflush`ed before a checkpoint can count it (`main:190-195`).
 - Cadence: every 20 light curves and whenever `boinc_time_to_checkpoint()` returns 1 (`main:194-197`), plus a final
-  write before `boinc_finish(0)` (`main:202`). The 20-light-curve writes ignore the volunteer's interval and are
-  outside a critical section (PLA-014).
-- Critical sections: only through `boinc_time_to_checkpoint()`. It is called twice in one opportunity, which leaves
-  the critical section open for the rest of the task: suspend, quit and abort stop working (PLA-001, high).
-- Known gaps: `trim_output()` rewrites `out` in place and no write or rename result is checked (PLA-004); a failed
-  open of the checkpoint or of `out` is treated as a fresh start and truncates `out` (PLA-013); write errors on `out`
-  are not checked before `boinc_finish(0)` (PLA-012); progress is not reported at resume (PLA-005).
+  write before `boinc_finish(0)` (`main:202`).
+- Critical sections: only through `boinc_time_to_checkpoint()`; call it once per opportunity and pair every 1 with
+  exactly one `boinc_checkpoint_completed()` (PAT-001).
+- Known gaps in this contract are open issues: `python3 docs/kb/shared/kb.py list --open --area checkpoint,io,boinc-lifecycle`.
+  Read them before changing the resume code.
 - A resume must reproduce exactly the lines that were cut away. It does with the same binary on the same device.
   A GPU task that restarts on another GPU of the same host mixes lines from two devices (rounding level, PLA-009).
 
@@ -112,9 +110,8 @@ OUT=<dir> bash tools/build_android.sh
 #   check() fails the build if a binary NEEDs anything but libc, libm, libdl, liblog
 ```
 
-OpenCL is never linked: `cl_dynload.c` loads it at run time, so only the headers are needed to build. The build
-scripts and `tools/ingest.py` use fixed paths of the build machines (PLA-008), and no script records the image,
-package, compiler or BOINC versions it used (PLA-021).
+OpenCL is never linked: `cl_dynload.c` loads it at run time, so only the headers are needed to build. Check the
+paths at the top of the build scripts and `tools/ingest.py` before running them (PAT-021).
 
 The standalone tool has no build script. It needs only a C++17 compiler; checked on 2026-10-27 on macOS arm64:
 
@@ -142,8 +139,7 @@ There are none: no test directory, no stub BOINC library, no reference outputs. 
 - `build_cpu.sh` and `build_gpu_server.sh` do not change directory: run them from a scratch directory that contains
   `src/`. They create `out/`, `obj_*`, `inc/` and `inner_ocl.sh` there; `.gitignore` covers only `build/` and
   `stage/`. `build_mac.sh` and `build_android.sh` change to the repository root.
-- The Android OpenCL build needs the Khronos OpenCL headers; the NDK has none. The script takes them from a fixed
-  directory (PLA-008).
+- The Android OpenCL build needs the Khronos OpenCL headers; the NDK has none.
 - Android: only aarch64 is built; the vendor library paths in `cl_dynload.c` are 64-bit only (PLA-018). App processes
   cannot see the vendor OpenCL library without the linker-namespace fallback of 3f6c1b7 (PLA-007); test under the
   BOINC client, not from `adb shell`.
@@ -152,7 +148,7 @@ There are none: no test directory, no stub BOINC library, no reference outputs. 
 - One OpenCL launch covers 4096 trial periods (`kChunk`, `planodia_opencl.cpp:102`): at most 36 ms per launch measured
   on an M1 even for a format-2 setting at the local-memory limit (ledger, PAT-016).
 - The CPU builds use libstdc++ (GCC, MinGW-w64 GCC) or libc++ (Apple clang, NDK, llvm-mingw); this matters for ties
-  in the peak order (PLA-011).
+  in the peak order (PAT-026).
 
 ## Conventions for changes
 
@@ -178,11 +174,18 @@ There are none: no test directory, no stub BOINC library, no reference outputs. 
 ## Knowledge base
 
 `docs/kb/` holds this repository's known bugs, platform traps and their fixes, and the bug patterns shared with the
-other bitboinc applications. Start at [docs/kb/INDEX.md](docs/kb/INDEX.md): its first table, "Fix next", is the work
-that is ready, with the next step for each issue. Before debugging a symptom, search it (`grep -ril "<words>" docs/kb`).
-After a fix or a new finding, update the issue. Workflow: [docs/kb/shared/PROCESS.md](docs/kb/shared/PROCESS.md).
+other bitboinc applications. This file names only rules, gotchas and design notes; the open issues are in the
+knowledge base, and the tool prints them more cheaply than the files:
 
-- Overview without opening files: `python3 docs/kb/shared/kb.py list --open [--platform windows] [--area checkpoint]`
-- New report: `python3 docs/kb/shared/kb.py new issue "symptom in a few words"`
-- A fix commit names its issue (`KB: PLA-NNN`) and, if any, its pattern (`Pattern: PAT-NNN`).
-- Before a pull request: `python3 docs/kb/shared/kb.py index && python3 docs/kb/shared/kb.py lint --strict`
+- What is ready to fix, one line each with its next step: `python3 docs/kb/shared/kb.py list --open --action fix`
+  (also `--area checkpoint`, `--platform windows`, `--action decide|verify|review`). Then read that issue's file and
+  the pattern it links (its "How to fix").
+- Across the bitboinc repositories checked out next to this one: `kb.py todo ../<repo> ...` groups their open issues
+  by shared pattern, so a fix is read once and made everywhere; `kb.py check PAT-NNN ../<repo> ...` checks a pattern.
+- Before debugging a symptom: `grep -ril "<words>" docs/kb ../*/docs/kb/issues`.
+- New report: `kb.py new issue "symptom in a few words" area=... next=...`.
+- After a fix: `kb.py set PLA-NNN status=fix-proposed` (or `status=fixed fixed_in=<commit>` once merged) with
+  `--log "..."`; the ledger and INDEX.md follow. The commit names the issue (`KB: PLA-NNN`) and, if any, the
+  pattern (`Pattern: PAT-NNN`).
+- Before a pull request: `python3 docs/kb/shared/kb.py index && python3 docs/kb/shared/kb.py lint --strict`.
+  Workflow: [docs/kb/shared/PROCESS.md](docs/kb/shared/PROCESS.md).
