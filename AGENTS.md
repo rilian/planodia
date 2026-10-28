@@ -78,9 +78,11 @@ What the code does at 3f6c1b7:
   outside a critical section (PLA-014).
 - Critical sections: only through `boinc_time_to_checkpoint()`. It is called twice in one opportunity, which leaves
   the critical section open for the rest of the task: suspend, quit and abort stop working (PLA-001, high).
-- Known gaps: `trim_output()` rewrites `out` in place and no write or rename result is checked (PLA-004); a failed
-  open of the checkpoint or of `out` is treated as a fresh start and truncates `out` (PLA-013); write errors on `out`
-  are not checked before `boinc_finish(0)` (PLA-012); progress is not reported at resume (PLA-005).
+- Known gaps:
+  - `trim_output()` rewrites `out` in place, and no write or rename result is checked (PLA-004).
+  - A failed open of the checkpoint or of `out` is treated as a fresh start and truncates `out` (PLA-013).
+  - Write errors on `out` are not checked before `boinc_finish(0)` (PLA-012).
+  - Progress is not reported at resume (PLA-005).
 - A resume must reproduce exactly the lines that were cut away. It does with the same binary on the same device.
   A GPU task that restarts on another GPU of the same host mixes lines from two devices (rounding level, PLA-009).
 
@@ -147,6 +149,14 @@ There are none: no test directory, no stub BOINC library, no reference outputs. 
 - Android: only aarch64 is built; the vendor library paths in `cl_dynload.c` are 64-bit only (PLA-018). App processes
   cannot see the vendor OpenCL library without the linker-namespace fallback of 3f6c1b7 (PLA-007); test under the
   BOINC client, not from `adb shell`.
+- OpenCL device and errors at 3f6c1b7:
+  - The device comes only from `--device`; `init_data`'s `gpu_opencl_dev_index` is never read (PLA-002).
+  - Devices are counted as `CL_DEVICE_TYPE_GPU` but fetched as `CL_DEVICE_TYPE_ALL`, and the fallback to all device
+    types can pick a CPU device (PLA-003).
+  - Initialisation and kernel failures end the task with `boinc_finish(1)` instead of a temporary exit (PLA-006;
+    question PLA-019).
+  - Buffer writes, reads and kernel arguments are not checked, so a failed transfer silently reuses old data
+    (PLA-015).
 - Apple Silicon OpenCL works (M1 on 2026-10-27: Apple platform with only the GPU device, 32 KB local memory, maximum
   work-group size 256). The kernel is float only; no fp64 is needed anywhere.
 - One OpenCL launch covers 4096 trial periods (`kChunk`, `planodia_opencl.cpp:102`): at most 36 ms per launch measured
@@ -181,12 +191,15 @@ There are none: no test directory, no stub BOINC library, no reference outputs. 
 applications. Workflow: [docs/kb/shared/PROCESS.md](docs/kb/shared/PROCESS.md).
 
 - Ready to fix, with next steps: `python3 docs/kb/shared/kb.py list --open --action fix` (also `--area`,
-  `--platform`); then the issue's file and the pattern it links.
+  `--platform`). Then `kb.py show PLA-NNN` for the issue and `kb.py show PAT-NNN` for the pattern it links, with the
+  BOINC API facts the pattern cites. In the code, read the functions that `where:` and the Cause name.
 - All repositories checked out next to this one: `kb.py todo`, then `kb.py todo --pattern PAT-NNN` for the next step
   and place of each issue; `kb.py check PAT-NNN` checks a pattern everywhere.
-- Before debugging a symptom: `grep -ril "<words>" ../*/docs/kb/issues docs/kb/shared/patterns`.
+- Before debugging a symptom: `grep -ril "<words>" ../*/docs/kb/issues docs/kb/shared/patterns`, then `kb.py show`
+  the ids it finds. Read other repositories through the shell (`kb.py show`, `git -C ../<repo> grep -n`, `sed -n`):
+  opening one of their files in an editor tool can load their whole AGENTS.md as well.
 - New report: `kb.py new issue "symptom in a few words" area=... next=...`.
 - After a fix: `kb.py set PLA-NNN status=fix-proposed --log "..."` (`status=fixed fixed_in=<commit>` once merged),
-  and update the lines of this file it prints. The commit names the issue (`KB: PLA-NNN`) and the pattern, if any
+  and update the passages of this file it prints. The commit names the issue (`KB: PLA-NNN`) and the pattern, if any
   (`Pattern: PAT-NNN`).
 - Before a pull request: `kb.py index && kb.py lint --strict`.
